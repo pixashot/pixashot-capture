@@ -35,7 +35,6 @@ class ScreenshotController extends Controller
             ]);
 
             if ($validator->fails()) {
-                // Match SvelteKit's ZodError format
                 $errors = collect($validator->errors()->messages())
                     ->map(fn($messages, $field) => "{$field}: {$messages[0]}")
                     ->join(', ');
@@ -43,36 +42,45 @@ class ScreenshotController extends Controller
                 return response()->json(['error' => $errors], 400);
             }
 
-            // Make request to Cloud Run
+            // Make request to Cloud Run with stream option
             $response = Http::withToken(config('pixashot.auth_token'))
+                ->withOptions(['stream' => true])
                 ->post(config('pixashot.endpoint') . '/capture', $validator->validated());
 
-            if (!$response->successful()) {
-                // Match SvelteKit's error format
-                return response()->json(
-                    ['error' => $response->json('message') ?? 'Unknown error occurred'],
-                    $response->status()
-                );
+            if ($response->status() !== 200) {
+                // For error responses, we need to get the full body to read the error message
+                $body = $response->body();
+                $errorMessage = json_decode($body, true)['message'] ?? 'Unknown error occurred';
+                return response()->json(['error' => $errorMessage], $response->status());
             }
 
             // Get the format for the content type
             $format = $params['format'] ?? 'png';
 
-            // Return the streamed response for display in browser
-            return response($response->body(), 200, [
-                'Content-Type' => "image/{$format}",
-                'Cache-Control' => sprintf(
-                    'public, max-age=%d, stale-while-revalidate=%d',
-                    config('pixashot.cache.max_age'),
-                    config('pixashot.cache.stale_while_revalidate')
-                ),
-                'X-Content-Type-Options' => 'nosniff',
-                'Content-Length' => $response->header('Content-Length'),
-            ]);
+            // Create a streaming response
+            return response()->stream(
+                function () use ($response) {
+                    if ($stream = $response->toPsrResponse()->getBody()) {
+                        while (!$stream->eof()) {
+                            echo $stream->read(1024);
+                        }
+                    }
+                },
+                200,
+                [
+                    'Content-Type' => "image/{$format}",
+                    'Cache-Control' => sprintf(
+                        'public, max-age=%d, stale-while-revalidate=%d',
+                        config('pixashot.cache.max_age'),
+                        config('pixashot.cache.stale_while_revalidate')
+                    ),
+                    'X-Content-Type-Options' => 'nosniff',
+                    'Content-Length' => $response->header('Content-Length'),
+                ]
+            );
 
         } catch (\Exception $e) {
             Log::error('Screenshot capture error:', ['error' => $e->getMessage()]);
-            // Match SvelteKit's generic error format
             return response()->json(
                 ['error' => 'An error occurred while processing your request'],
                 500
